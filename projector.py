@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 import dnnlib
 import legacy
+from metrics import metric_utils
 
 
 def project(
@@ -29,7 +30,9 @@ def project(
         noise_ramp_length=0.75,
         regularize_noise_weight=1e5,
         verbose=False,
-        device: torch.device
+        device: torch.device,
+        label: torch.Tensor,
+        noise_mode="const"
 ):
     assert target.shape == (G.img_channels, G.img_resolution, G.img_resolution)
 
@@ -47,13 +50,11 @@ def project(
     w_avg = np.mean(w_samples, axis=0, keepdims=True)  # [1, 1, C]
     w_std = (np.sum((w_samples - w_avg) ** 2) / w_avg_samples) ** 0.5
 
-    # Setup noise inputs.
-    noise_bufs = {name: buf for (name, buf) in G.synthesis.named_buffers() if 'noise_const' in name}
-
     # Load VGG16 feature detector.
-    url = 'https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/metrics/vgg16.pt'
-    with dnnlib.util.open_url(url) as f:
-        vgg16 = torch.jit.load(f).eval().to(device)
+    # url = 'https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/metrics/vgg16.pt'
+    # with dnnlib.util.open_url(url) as f:
+    vgg16_url = 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/vgg16.pkl'
+    vgg16 = metric_utils.get_feature_detector(vgg16_url, device=device)
 
     # Features for target image.
     target_images = target.unsqueeze(0).to(device).to(torch.float32)
@@ -63,17 +64,11 @@ def project(
 
     w_opt = torch.tensor(w_avg, dtype=torch.float32, device=device, requires_grad=True)  # pylint: disable=not-callable
     w_out = torch.zeros([num_steps] + list(w_opt.shape[1:]), dtype=torch.float32, device=device)
-    optimizer = torch.optim.Adam([w_opt] + list(noise_bufs.values()), betas=(0.9, 0.999), lr=initial_learning_rate)
-
-    # Init noise.
-    for buf in noise_bufs.values():
-        buf[:] = torch.randn_like(buf)
-        buf.requires_grad = True
+    optimizer = torch.optim.Adam([w_opt], betas=(0.9, 0.999), lr=initial_learning_rate)
 
     for step in range(num_steps):
         # Learning rate schedule.
         t = step / num_steps
-        w_noise_scale = w_std * initial_noise_factor * max(0.0, 1.0 - t / noise_ramp_length) ** 2
         lr_ramp = min(1.0, (1.0 - t) / lr_rampdown_length)
         lr_ramp = 0.5 - 0.5 * np.cos(lr_ramp * np.pi)
         lr_ramp = lr_ramp * min(1.0, t / lr_rampup_length)
@@ -82,9 +77,7 @@ def project(
             param_group['lr'] = lr
 
         # Synth images from opt_w.
-        w_noise = torch.randn_like(w_opt) * w_noise_scale
-        ws = (w_opt + w_noise).repeat([1, G.mapping.num_ws, 1])
-        synth_images = G.synthesis(ws, noise_mode='const')
+        synth_images = G(w_opt[0], label, noise_mode=noise_mode)
 
         # Downsample image to 256x256 if it's larger than that. VGG was built for 224x224 images.
         synth_images = (synth_images + 1) * (255 / 2)
@@ -95,17 +88,7 @@ def project(
         synth_features = vgg16(synth_images, resize_images=False, return_lpips=True)
         dist = (target_features - synth_features).square().sum()
 
-        # Noise regularization.
-        reg_loss = 0.0
-        for v in noise_bufs.values():
-            noise = v[None, None, :, :]  # must be [1,1,H,W] for F.avg_pool2d()
-            while True:
-                reg_loss += (noise * torch.roll(noise, shifts=1, dims=3)).mean() ** 2
-                reg_loss += (noise * torch.roll(noise, shifts=1, dims=2)).mean() ** 2
-                if noise.shape[2] <= 8:
-                    break
-                noise = F.avg_pool2d(noise, kernel_size=2)
-        loss = dist + reg_loss * regularize_noise_weight
+        loss = dist
 
         # Step
         optimizer.zero_grad(set_to_none=True)
@@ -116,13 +99,8 @@ def project(
         # Save projected W for each optimization step.
         w_out[step] = w_opt.detach()[0]
 
-        # Normalize noise.
-        with torch.no_grad():
-            for buf in noise_bufs.values():
-                buf -= buf.mean()
-                buf *= buf.square().mean().rsqrt()
 
-    return w_out.repeat([1, G.mapping.num_ws, 1])
+    return w_out
 
 
 # ----------------------------------------------------------------------------
@@ -147,7 +125,7 @@ def run_projection(
     Examples:
     \b
     python projector.py --outdir=out --target=~/mytargetimg.png \\
-        --network=https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/ffhq.pkl
+        --network=https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/stylegan3-r-afhqv2-512x512.pkl
     """
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -156,7 +134,7 @@ def run_projection(
     print('Loading networks from "%s"...' % network_pkl)
     device = torch.device('cuda')
     with dnnlib.util.open_url(network_pkl) as fp:
-        G = legacy.load_network_pkl(fp)['G_ema'].requires_grad_(False).to(device)  # type: ignore
+        G = legacy.load_network_pkl(fp)['G_ema'].to(device)  # type: ignore
 
     # Load target image.
     target_pil = PIL.Image.open(target_fname).convert('RGB')
@@ -166,6 +144,10 @@ def run_projection(
     target_pil = target_pil.resize((G.img_resolution, G.img_resolution), PIL.Image.LANCZOS)
     target_uint8 = np.array(target_pil, dtype=np.uint8)
 
+    # Label and noise_mode (random/none/const)
+    label = torch.zeros([1, G.c_dim], device=device)
+    noise_mode = "const"
+
     # Optimize projection.
     start_time = perf_counter()
     projected_w_steps = project(
@@ -173,7 +155,9 @@ def run_projection(
         target=torch.tensor(target_uint8.transpose([2, 0, 1]), device=device),  # pylint: disable=not-callable
         num_steps=num_steps,
         device=device,
-        verbose=True
+        verbose=True,
+        label=label,
+        noise_mode=noise_mode
     )
     print(f'Elapsed: {(perf_counter() - start_time):.1f} s')
 
@@ -183,7 +167,7 @@ def run_projection(
         video = imageio.get_writer(f'{outdir}/proj.mp4', mode='I', fps=10, codec='libx264', bitrate='16M')
         print(f'Saving optimization progress video "{outdir}/proj.mp4"')
         for projected_w in projected_w_steps:
-            synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode='const')
+            synth_image = G(projected_w, label, truncation_psi=1, noise_mode=noise_mode)
             synth_image = (synth_image + 1) * (255 / 2)
             synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
             video.append_data(np.concatenate([target_uint8, synth_image], axis=1))
@@ -192,7 +176,7 @@ def run_projection(
     # Save final projected frame and W vector.
     target_pil.save(f'{outdir}/target.png')
     projected_w = projected_w_steps[-1]
-    synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode='const')
+    synth_image = G(projected_w, label, noise_mode=noise_mode)
     synth_image = (synth_image + 1) * (255 / 2)
     synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
     PIL.Image.fromarray(synth_image, 'RGB').save(f'{outdir}/proj.png')
